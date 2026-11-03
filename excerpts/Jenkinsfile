@@ -1,0 +1,195 @@
+// Excerpt from the private Readers Book Club repository (Jenkinsfile, unchanged).
+
+// Readers Book Club CI/CD
+//
+// Run as a Multibranch Pipeline. Every branch and pull request is linted and tested;
+// only `main` builds images, deploys to staging (when DEPLOY_STAGING is 'true'), and
+// (after approval) to production.
+//
+// Region and URLs are set in the environment block below, not in Jenkins.
+// AWS access comes from the Jenkins server's IAM role; no keys are stored in Jenkins.
+// Plugins used: Pipeline, Git, Workspace Cleanup (cleanWs).
+//
+// The server has one executor (memory). The production approval waits without an
+// agent, so a pending approval never blocks other builds.
+
+pipeline {
+  agent none
+
+  options {
+    buildDiscarder(logRotator(numToKeepStr: '30'))
+    skipDefaultCheckout()
+  }
+
+  environment {
+    AWS_REGION     = 'eu-west-1'
+    PRODUCTION_URL = 'https://teeblissreadersclub.click'
+    // Only used when DEPLOY_STAGING is 'true'
+    STAGING_URL    = 'https://staging.teeblissreadersclub.click'
+    FRONTEND_REPO = 'readers-bookclub-frontend'
+    BACKEND_REPO  = 'readers-bookclub-backend'
+    // npm and the test tools need far less than a Next.js build; keep them modest
+    NODE_OPTIONS  = '--max-old-space-size=1536'
+    CI            = 'true'
+    // Staging is torn down until launch to save cost (see infrastructure/terraform/README.md).
+    // Set to 'true' once `terraform apply` has recreated envs/staging.
+    DEPLOY_STAGING = 'false'
+  }
+
+  stages {
+    stage('Build and test') {
+      agent any
+      options {
+        timeout(time: 45, unit: 'MINUTES')
+      }
+
+      stages {
+        stage('Checkout') {
+          steps {
+            checkout scm
+            script {
+              env.SHORT_SHA = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+              env.IMAGE_TAG = "${env.BUILD_NUMBER}-${env.SHORT_SHA}"
+            }
+          }
+        }
+
+        // Sequential on purpose: one npm install at a time fits in 4 GB
+        stage('Install dependencies') {
+          steps {
+            dir('apps/backend')  { sh 'npm ci --no-audit --no-fund' }
+            dir('apps/frontend') { sh 'npm ci --no-audit --no-fund' }
+          }
+        }
+
+        stage('Lint') {
+          steps {
+            // Without --fix: CI reports problems, it does not rewrite files
+            dir('apps/backend')  { sh 'npx eslint "{src,test}/**/*.ts"' }
+            dir('apps/frontend') { sh 'npm run lint && npx tsc --noEmit' }
+          }
+        }
+
+        stage('Unit tests') {
+          steps {
+            dir('apps/backend') { sh 'npm test -- --ci' }
+          }
+        }
+
+        stage('Integration tests') {
+          steps {
+            // Uses an in-memory MongoDB; no external services needed
+            dir('apps/backend') { sh 'npm run test:e2e -- --ci' }
+          }
+        }
+
+        stage('Security scan: dependencies') {
+          steps {
+            dir('apps/backend')  { sh 'npm audit --omit=dev --audit-level=high' }
+            dir('apps/frontend') { sh 'npm audit --omit=dev --audit-level=high' }
+            // Committed passwords, keys and tokens
+            sh 'trivy fs --scanners secret --exit-code 1 --skip-dirs "**/node_modules" .'
+          }
+        }
+
+        // The Docker builds compile the apps (nest build / next build), so there is
+        // no separate host build. Images are built only for main.
+        stage('Docker build') {
+          when { branch 'main' }
+          steps {
+            script {
+              env.REGISTRY = sh(
+                script: 'echo "$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${AWS_REGION}.amazonaws.com"',
+                returnStdout: true
+              ).trim()
+            }
+            // One after the other, never in parallel (memory)
+            sh 'docker build --pull -t "$REGISTRY/$BACKEND_REPO:$IMAGE_TAG" apps/backend'
+            sh 'docker build --pull -t "$REGISTRY/$FRONTEND_REPO:$IMAGE_TAG" apps/frontend'
+          }
+        }
+
+        stage('Security scan: images') {
+          when { branch 'main' }
+          steps {
+            sh 'trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$REGISTRY/$BACKEND_REPO:$IMAGE_TAG"'
+            sh 'trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$REGISTRY/$FRONTEND_REPO:$IMAGE_TAG"'
+          }
+        }
+
+        stage('Push images') {
+          when { branch 'main' }
+          steps {
+            sh 'aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$REGISTRY"'
+            sh '''
+              for repo in "$BACKEND_REPO" "$FRONTEND_REPO"; do
+                docker push "$REGISTRY/$repo:$IMAGE_TAG"
+                docker tag  "$REGISTRY/$repo:$IMAGE_TAG" "$REGISTRY/$repo:latest"
+                docker push "$REGISTRY/$repo:latest"
+              done
+            '''
+          }
+        }
+
+        stage('Deploy to staging') {
+          when {
+            allOf {
+              branch 'main'
+              environment name: 'DEPLOY_STAGING', value: 'true'
+            }
+          }
+          steps {
+            sh 'infrastructure/scripts/ecs-deploy.sh rbc-staging backend  backend  "$REGISTRY/$BACKEND_REPO:$IMAGE_TAG"'
+            sh 'infrastructure/scripts/ecs-deploy.sh rbc-staging frontend frontend "$REGISTRY/$FRONTEND_REPO:$IMAGE_TAG"'
+            sh 'infrastructure/scripts/smoke-test.sh "$STAGING_URL"'
+          }
+        }
+      }
+
+      post {
+        always {
+          // Local images are already in ECR; free the disk
+          sh '''
+            if [ -n "${REGISTRY:-}" ]; then
+              docker image rm -f \\
+                "$REGISTRY/$BACKEND_REPO:$IMAGE_TAG" "$REGISTRY/$BACKEND_REPO:latest" \\
+                "$REGISTRY/$FRONTEND_REPO:$IMAGE_TAG" "$REGISTRY/$FRONTEND_REPO:latest" 2>/dev/null || true
+            fi
+          '''
+          cleanWs()
+        }
+      }
+    }
+
+    stage('Approve production') {
+      when { branch 'main' }
+      steps {
+        // A newer build reaching this point aborts this one if it is still waiting
+        milestone(1)
+        // Waits up to a day for someone to click "Deploy", then gives up
+        timeout(time: 1, unit: 'DAYS') {
+          input message: "Deploy ${env.IMAGE_TAG} to production?", ok: 'Deploy'
+        }
+      }
+    }
+
+    stage('Deploy to production') {
+      when {
+        beforeAgent true
+        branch 'main'
+      }
+      agent any
+      steps {
+        milestone(2)
+        checkout scm
+        // Backend first, so the new frontend never calls an API that does not exist yet
+        sh 'infrastructure/scripts/ecs-deploy.sh rbc-production backend  backend  "$REGISTRY/$BACKEND_REPO:$IMAGE_TAG"'
+        sh 'infrastructure/scripts/ecs-deploy.sh rbc-production frontend frontend "$REGISTRY/$FRONTEND_REPO:$IMAGE_TAG"'
+        sh 'infrastructure/scripts/smoke-test.sh "$PRODUCTION_URL"'
+      }
+      post {
+        always { cleanWs() }
+      }
+    }
+  }
+}
